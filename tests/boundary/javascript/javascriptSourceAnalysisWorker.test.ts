@@ -5,6 +5,8 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 import { expect, it } from "vitest";
 import { JavaScriptAnalysisWorker } from "../../../src/javascript/analysis/JavaScriptAnalysisWorker.js";
+import { createJavaScriptSourceAnalysis } from "../../../src/artifacts/javascript/JavaScriptSourceAnalysis.js";
+import { ArtifactResourceScope } from "../../../src/artifacts/ArtifactResourceScope.js";
 import { cleanupOwnedProcessGroup } from "../../../src/process/ProcessOwnership.js";
 import type { OwnedProcessGroup } from "../../../src/process/ProcessOwnership.js";
 import { createTestTempDirectory } from "../../fixtures/temporaryDirectory.js";
@@ -87,6 +89,86 @@ it("reuses one real owned analyzer while retaining distinct source identities an
     ).toEqual([]);
   } finally {
     await worker.close();
+  }
+});
+
+it("reuses one owned worker across analyses on the same resource scope", async () => {
+  const scope = new ArtifactResourceScope();
+  const launches: number[] = [];
+  const exits = new Map<number, Promise<void>>();
+  const launcher: typeof spawnOwnedProviderProcess = async (request) => {
+    const previous = launches.at(-1);
+    if (previous !== undefined) await exits.get(previous);
+    const spawned = await spawnOwnedProviderProcess(request);
+    const pid = spawned.process.pid;
+    if (pid === undefined)
+      throw new Error("Owned analyzer has no observed PID");
+    exits.set(
+      pid,
+      new Promise((resolve) => {
+        spawned.process.once("exit", () => {
+          resolve();
+        });
+      }),
+    );
+    launches.push(pid);
+    return spawned;
+  };
+  const limits = { heapMb: 128, timeoutMs: 30_000 };
+  const first = source("first.mjs", "export const observed = 1;");
+  const second = source("second.mjs", "export const observed = 2;");
+  const files = [first, second];
+  try {
+    for (const file of files) {
+      const worker = await createJavaScriptSourceAnalysis(limits, 1, {
+        scope,
+        launcher,
+      });
+      try {
+        const result = await worker.analyze(file, {
+          nodes: 100,
+          unknowns: 100,
+        });
+        if (!result.ok) throw result.error.error;
+        expect(result.value.javascript.parse_status).toBe("complete");
+      } finally {
+        await worker.close();
+      }
+    }
+    expect(launches).toHaveLength(1);
+    const replaced = await createJavaScriptSourceAnalysis(
+      { heapMb: 256, timeoutMs: 30_000 },
+      1,
+      { scope, launcher },
+    );
+    try {
+      const result = await replaced.analyze(first, {
+        nodes: 100,
+        unknowns: 100,
+      });
+      if (!result.ok) throw result.error.error;
+      expect(result.value.javascript.parse_status).toBe("complete");
+    } finally {
+      await replaced.close();
+    }
+    expect(launches).toHaveLength(2);
+    await scope.close();
+    const reopened = await createJavaScriptSourceAnalysis(limits, 1, {
+      scope,
+      launcher,
+    });
+    try {
+      const result = await reopened.analyze(first, {
+        nodes: 100,
+        unknowns: 100,
+      });
+      if (!result.ok) throw result.error.error;
+    } finally {
+      await reopened.close();
+    }
+    expect(launches).toHaveLength(3);
+  } finally {
+    await scope.close();
   }
 });
 

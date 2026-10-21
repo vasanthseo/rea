@@ -19,7 +19,7 @@ describe("executable dispatcher", () => {
         ),
         workspace.write(
           "dist/cli-runtime/cli.js",
-          'export const cliConfigurationError = () => undefined; export const createCli = () => ({ serve: (_args, options) => { options.stdout("first document\\n"); throw new RangeError("Invalid string length"); } });\n',
+          'export const cliConfigurationError = () => undefined; export const closeCliJavaScriptResources = () => {}; export const createCli = () => ({ serve: (_args, options) => { options.stdout("first document\\n"); throw new RangeError("Invalid string length"); } });\n',
         ),
         workspace.write(
           "dist/cli-runtime/cliOutput.js",
@@ -60,7 +60,7 @@ describe("executable dispatcher", () => {
         ),
         workspace.write(
           "dist/cli-runtime/cli.js",
-          'export const cliConfigurationError = () => undefined; export const createCli = () => ({ serve: (args) => process.stdout.write(JSON.stringify({ adapter: "cli", args })) });\n',
+          'export const cliConfigurationError = () => undefined; export const closeCliJavaScriptResources = () => {}; export const createCli = () => ({ serve: (args) => process.stdout.write(JSON.stringify({ adapter: "cli", args })) });\n',
         ),
         workspace.write(
           "dist/cli-runtime/cliOutput.js",

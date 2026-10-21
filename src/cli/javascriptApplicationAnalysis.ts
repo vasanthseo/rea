@@ -7,7 +7,26 @@ import { projectAnalysisError } from "../domain/analysisErrorProjection.js";
 import type { JsonValue } from "../domain/jsonValue.js";
 import { ProviderCleanupError } from "../domain/providerCleanupError.js";
 
-/** Execute the shared one-shot CLI boundary for static JavaScript analysis. */
+/**
+ * One scope for every JavaScript analysis in this process. A healthy worker
+ * stays parked between commands; {@link closeCliJavaScriptResources} stops it.
+ * Pending cleanup is still retried before each command returns.
+ */
+let retainedScope: ArtifactResourceScope | undefined;
+
+const cliAnalysisScope = (): ArtifactResourceScope => {
+  retainedScope ??= new ArtifactResourceScope();
+  return retainedScope;
+};
+
+/** Stop the process-owned JavaScript worker. Safe to call more than once. */
+export const closeCliJavaScriptResources = async (): Promise<void> => {
+  const scope = retainedScope;
+  retainedScope = undefined;
+  if (scope !== undefined) await scope.close();
+};
+
+/** Execute the shared CLI boundary for static JavaScript analysis. */
 export const runCliJavaScriptApplicationAnalysis = async (
   input: unknown,
   signal?: AbortSignal,
@@ -20,13 +39,14 @@ export const runCliJavaScriptApplicationAnalysis = async (
     },
     { minimumIntervalMs: 0 },
   );
-  const resources = new ArtifactResourceScope();
+  const resources = cliAnalysisScope();
   const result = await analyzeJavaScriptApplication(input, resources, {
     progress,
     ...(signal === undefined ? {} : { signal }),
   });
   try {
-    await resources.close();
+    // Retry failed owners without stopping a healthy parked worker.
+    await resources.retryCleanup();
   } catch (cause: unknown) {
     const cleanup = ArtifactReaderFailure.cleanupObservation(
       cause,

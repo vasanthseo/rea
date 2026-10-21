@@ -95,6 +95,8 @@ export class ArtifactResourceScope {
   >();
   readonly #active = new Set<Promise<unknown>>();
   #draining: Promise<void> | undefined;
+  #closeInFlight: Promise<void> | undefined;
+  #closeHook: (() => Promise<void>) | undefined;
   #closed = false;
 
   get hasPending(): boolean {
@@ -203,10 +205,91 @@ export class ArtifactResourceScope {
     return this.#draining;
   }
 
+  /**
+   * Run after retained owners are released. The hook stays registered so a
+   * later close retries it. Concurrent closes share one in-flight attempt.
+   */
+  addCloseHook(hook: () => Promise<void>): void {
+    const previous = this.#closeHook;
+    this.#closeHook =
+      previous === undefined
+        ? hook
+        : async () => {
+            await previous();
+            await hook();
+          };
+  }
+
   /** Stop admission, wait for active operations, and retry every retained owner. */
   close(): Promise<void> {
     this.#closed = true;
-    return this.retryCleanup();
+    if (this.#closeInFlight !== undefined) return this.#closeInFlight;
+    const attempt = this.#finishClose();
+    let published: Promise<void>;
+    published = attempt.finally(() => {
+      if (this.#closeInFlight === published) this.#closeInFlight = undefined;
+    });
+    this.#closeInFlight = published;
+    return published;
+  }
+
+  async #finishClose(): Promise<void> {
+    // A parked analyzer is not a pending owner. Stop it even when another
+    // retained cleanup is still failing. A later close retries both.
+    const cleanup = await this.retryCleanup().then(
+      () => undefined,
+      (cause: unknown) => cause,
+    );
+    const hookFailure = await Promise.resolve()
+      .then(() => this.#closeHook?.())
+      .then(
+        () => undefined,
+        (cause: unknown) => cause,
+      );
+    if (cleanup !== undefined && hookFailure !== undefined)
+      throw this.#composeCloseFailures(cleanup, hookFailure);
+    if (hookFailure !== undefined) throw hookFailure;
+    if (cleanup !== undefined) throw cleanup;
+  }
+
+  /**
+   * Report both outstanding owners. The pending set and the close hook stay
+   * registered, so the next close retries each failed path.
+   */
+  #composeCloseFailures(
+    cleanup: unknown,
+    hookFailure: unknown,
+  ): ArtifactReaderFailure {
+    const retained = ArtifactReaderFailure.cleanupObservation(
+      cleanup,
+      "retained artifact cleanup",
+    );
+    const hook = ArtifactReaderFailure.cleanupObservation(
+      hookFailure,
+      "close hook",
+    );
+    const resources = [...new Set([...retained.resources, ...hook.resources])];
+    const options = {
+      cause: new AggregateError(
+        [cleanup, hookFailure],
+        "Retained cleanup and a close hook both failed",
+      ),
+      cleanup: {
+        reason: `${retained.reason}; ${hook.reason}`,
+        resources,
+      },
+    };
+    const message = `Artifact cleanup remains incomplete: ${resources.join(", ")}`;
+    if (cleanup instanceof ArtifactResourceRetryFailure)
+      return new ArtifactResourceRetryFailure(
+        cleanup.failedOwners.map((owner) => ({
+          owner,
+          lease: this.#lease(owner),
+        })),
+        message,
+        options,
+      );
+    return new ArtifactReaderFailure("unavailable", message, options);
   }
 
   async #drainAndRetry(): Promise<void> {
